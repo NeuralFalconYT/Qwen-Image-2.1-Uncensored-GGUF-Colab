@@ -115,7 +115,7 @@ def generate_image(
         sampler_name=sampler_name,
         scheduler=scheduler,
         seed=seed_value,
-        output_dir="/content/saved_images",
+        output_dir="./saved_images",
         cleanup_after=True,
         verbose=True,
     )
