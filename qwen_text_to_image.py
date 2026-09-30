@@ -89,7 +89,6 @@ def detect_environment() -> str:
 
     return "local"
 
-
 def get_root_path() -> Path:
     env = detect_environment()
 
