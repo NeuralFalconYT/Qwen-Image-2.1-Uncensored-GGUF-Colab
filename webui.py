@@ -360,7 +360,7 @@ with gr.Blocks(fill_height=True) as demo:
                         precision=0,
                         visible=False,
                     )
-               negative_prompt = gr.Textbox(
+                negative_prompt = gr.Textbox(
                     label="🚫 Negative Prompt",
                     value=DEFAULT_NEGATIVE,
                     lines=3,
