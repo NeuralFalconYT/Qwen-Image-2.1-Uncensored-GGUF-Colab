@@ -235,7 +235,7 @@ with gr.Blocks(fill_height=True) as demo:
     gr.Markdown(
         """
 # 🎨 Qwen Image 2.1 Uncensored GGUF
-**Local AI image generation with ComfyUI + GGUF**
+**@NeuralFalcon**
         """,
         elem_classes="header-text",
     )
@@ -256,11 +256,6 @@ with gr.Blocks(fill_height=True) as demo:
                 autofocus=True,
             )
 
-            negative_prompt = gr.Textbox(
-                label="🚫 Negative Prompt",
-                value=DEFAULT_NEGATIVE,
-                lines=3,
-            )
 
             # Main/simple setting stays OUTSIDE Advanced Settings.
             aspect_ratio = gr.Dropdown(
@@ -364,6 +359,11 @@ with gr.Blocks(fill_height=True) as demo:
                         value=42,
                         precision=0,
                         visible=False,
+                    )
+               negative_prompt = gr.Textbox(
+                    label="🚫 Negative Prompt",
+                    value=DEFAULT_NEGATIVE,
+                    lines=3,
                     )
 
                 randomize_seed.change(
