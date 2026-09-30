@@ -477,4 +477,6 @@ if __name__ == "__main__":
         css=CSS,
         footer_links=["api", "gradio"],
         mcp_server=True,
+        debug=True,
+        share=True
     )
