@@ -386,6 +386,7 @@ def main(argv=None):
     gguf_dir = nodes_dir / "ComfyUI-GGUF"
     git_clone(GGUF_REPO, gguf_dir, "ComfyUI-GGUF")
     pip_requirements(gguf_dir, "ComfyUI-GGUF")
+    os.system("pip install -qq gradio==6.26.0")
 
     # ---------- downloads ----------
     section("DOWNLOAD ENGINE")
