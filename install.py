@@ -104,14 +104,17 @@ def banner():
 # ============================================================
 
 
-def detect_environment():
+def detect_environment() -> str:
+    # Check Kaggle first
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return "kaggle"
+
     try:
         import google.colab  # noqa: F401
         return "colab"
     except ImportError:
         pass
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
-        return "kaggle"
+
     return "local"
 
 
