@@ -1,34 +1,3 @@
-"""
-qwen_text_to_image.py
-
-Direct Python wrapper around ComfyUI + ComfyUI-GGUF for Qwen Image 2.1.
-
-Notebook usage:
-    import qwen_text_to_image as qwen
-
-    await qwen.load_model()
-
-    result = qwen.generate_image(
-        prompt="cinematic anime hero in a neon city",
-        negative_prompt="blurry, low quality",
-        width=1280,
-        height=720,
-        steps=28,
-        cfg=2.2,
-    )
-
-    print(result["path"])
-    display(result["image"])
-
-    qwen.unload_model()
-
-Notes:
-- Width/height are supplied directly. There is no built-in T4 resolution map.
-- Dimensions are automatically aligned to multiples of 16 by default.
-- Models stay loaded between generate_image() calls.
-- Temporary tensors / CUDA cache are cleaned after each generation.
-"""
-
 from __future__ import annotations
 
 import gc
@@ -69,6 +38,8 @@ vae_decoder = None
 NODE_CLASS_MAPPINGS = None
 model_management = None
 
+DEVICE_MAP: dict[str, str] = {}
+
 _LOADED = False
 
 
@@ -77,7 +48,6 @@ _LOADED = False
 # ============================================================
 
 def detect_environment() -> str:
-    # Check Kaggle first
     if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
         return "kaggle"
 
@@ -88,6 +58,7 @@ def detect_environment() -> str:
         pass
 
     return "local"
+
 
 def get_root_path() -> Path:
     env = detect_environment()
@@ -137,33 +108,18 @@ def _align_dimension(value: int, multiple: int = 16) -> int:
 
 
 def _make_filename(prompt: str, seed: int) -> str:
-    """
-    Build:
-      first_20_prompt_words_<short-uuid>.png
-    """
-
+    """first_20_prompt_words_<short-uuid>_<seed>.png"""
     words = re.findall(r"[A-Za-z0-9]+", prompt)[:20]
 
     if not words:
         words = ["qwen_image"]
 
     slug = "_".join(words).lower()
-
-    # Keep filenames reasonable even with long prompt words.
     slug = slug[:150].strip("_")
 
     short_uuid = uuid.uuid4().hex[:10]
 
     return f"{slug}_{short_uuid}_{seed}.png"
-
-
-def _tensor_to_pil(images) -> Image.Image:
-    tensor = images[0]
-
-    arr = tensor.detach().cpu().numpy()
-    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-
-    return Image.fromarray(arr)
 
 
 # ============================================================
@@ -227,6 +183,151 @@ def print_vram(prefix: str = "VRAM") -> None:
 
 
 # ============================================================
+# DEVICE PLACEMENT
+# ============================================================
+
+def _normalize_device(device: str | int) -> str:
+    """Accept 0, 1, "0", "cuda:1" ... and return "cuda:N"."""
+    if isinstance(device, int):
+        return f"cuda:{device}"
+
+    device = str(device).strip().lower()
+
+    if device.isdigit():
+        return f"cuda:{device}"
+
+    if device == "cuda":
+        return "cuda:0"
+
+    if not device.startswith("cuda:"):
+        raise ValueError(
+            f"Invalid device '{device}'. Use 'cuda:0' or 'cuda:1' "
+            "(no 'default' / 'cpu')."
+        )
+
+    return device
+
+
+def resolve_devices(
+    unet_device: str | int | None = None,
+    clip_device: str | int | None = None,
+    vae_device: str | int | None = None,
+) -> dict[str, str]:
+    """
+    Decide where every model goes.
+
+      1 GPU  -> everything cuda:0
+      2+ GPU -> UNET cuda:0, CLIP cuda:1, VAE cuda:1
+    """
+    gpu_count = torch.cuda.device_count()
+
+    if gpu_count >= 2:
+        defaults = {"unet": "cuda:0", "clip": "cuda:1", "vae": "cuda:1"}
+    else:
+        defaults = {"unet": "cuda:0", "clip": "cuda:0", "vae": "cuda:0"}
+
+    chosen = {
+        "unet": _normalize_device(unet_device) if unet_device is not None else defaults["unet"],
+        "clip": _normalize_device(clip_device) if clip_device is not None else defaults["clip"],
+        "vae": _normalize_device(vae_device) if vae_device is not None else defaults["vae"],
+    }
+
+    for role, dev in chosen.items():
+        idx = int(dev.split(":")[1])
+        if idx >= gpu_count:
+            raise RuntimeError(
+                f"{role} device is {dev} but only {gpu_count} GPU(s) detected."
+            )
+
+    return chosen
+
+
+def _load_on_device(
+    candidates: Sequence[str],
+    device: str,
+    kwargs: dict[str, Any],
+    label: str,
+    allow_plain_fallback: str | None = None,
+    plain_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    """
+    Load a model with an explicit device using a MultiGPU loader node.
+
+    candidates            : MultiGPU node names to try, in order.
+    allow_plain_fallback  : core node name usable ONLY when the device is
+                            cuda:0 on a single-GPU machine (core ComfyUI
+                            already lands on cuda:0 there).
+    """
+    for node_name in candidates:
+        if node_name not in NODE_CLASS_MAPPINGS:
+            continue
+
+        loader = NODE_CLASS_MAPPINGS[node_name]()
+        info = loader.INPUT_TYPES()
+        inputs = {**info.get("required", {}), **info.get("optional", {})}
+
+        device_key = None
+        for key in ("device", "compute_device"):
+            if key in inputs:
+                device_key = key
+                break
+
+        if device_key is None:
+            raise RuntimeError(
+                f"{node_name} has no device input; cannot place {label} on {device}."
+            )
+
+        options = inputs[device_key][0]
+        if isinstance(options, (list, tuple)) and device not in options:
+            raise RuntimeError(
+                f"{node_name} does not offer '{device}'. "
+                f"Available: {list(options)}"
+            )
+
+        call_kwargs = dict(kwargs)
+        call_kwargs[device_key] = device
+
+        fn = getattr(loader, loader.FUNCTION)
+        return get_output(fn(**call_kwargs)), node_name
+
+    # No MultiGPU node found.
+    if (
+        allow_plain_fallback
+        and torch.cuda.device_count() == 1
+        and device == "cuda:0"
+        and allow_plain_fallback in NODE_CLASS_MAPPINGS
+    ):
+        loader = NODE_CLASS_MAPPINGS[allow_plain_fallback]()
+        fn = getattr(loader, loader.FUNCTION)
+        return get_output(fn(**(plain_kwargs or kwargs))), allow_plain_fallback
+
+    raise RuntimeError(
+        f"Cannot place {label} on {device}: none of {list(candidates)} found.\n"
+        "Install ComfyUI-MultiGPU into ComfyUI/custom_nodes and restart:\n"
+        "  git clone https://github.com/pollockjj/ComfyUI-MultiGPU "
+        "ComfyUI/custom_nodes/ComfyUI-MultiGPU"
+    )
+
+
+def _describe_device(model_obj: Any) -> str:
+    """Best-effort readout of where a ComfyUI model object will run."""
+    for attr_path in (
+        ("load_device",),
+        ("patcher", "load_device"),
+        ("first_stage_model", "device"),
+        ("device",),
+    ):
+        try:
+            obj = model_obj
+            for attr in attr_path:
+                obj = getattr(obj, attr)
+            return str(obj)
+        except Exception:
+            continue
+    return "unknown"
+
+
+# ============================================================
 # MODEL LOAD
 # ============================================================
 
@@ -235,24 +336,24 @@ async def load_model(
     unet_name: str = UNET_NAME,
     clip_name: str = CLIP_NAME,
     vae_name: str = VAE_NAME,
-    prefer_multi_gpu: bool = True,
+    unet_device: str | int | None = None,
+    clip_device: str | int | None = None,
+    vae_device: str | int | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """
-    Load Qwen Image 2.1 once.
+    Load Qwen Image 2.1 once, with explicit GPU placement.
 
-    In Colab/Jupyter:
-        await qwen.load_model()
+    Defaults:
+        1 GPU  : UNET/CLIP/VAE all on cuda:0
+        2 GPUs : UNET cuda:0 | CLIP cuda:1 | VAE cuda:1
 
-    Single GPU:
-        Uses normal ComfyUI loaders.
-
-    Multiple GPUs:
-        If compatible MultiGPU custom nodes are installed, the function
-        tries to place the UNET on cuda:0 and auxiliary model on cuda:1.
-        Otherwise it safely falls back to standard ComfyUI loading.
+    Manual override example:
+        await qwen.load_model(unet_device="cuda:0",
+                              clip_device="cuda:1",
+                              vae_device="cuda:0")
     """
-    global COMFY_PATH
+    global COMFY_PATH, DEVICE_MAP
     global UNET, CLIP, VAE
     global text_encoder, sampler, vae_decoder
     global NODE_CLASS_MAPPINGS, model_management
@@ -261,10 +362,12 @@ async def load_model(
     if _LOADED:
         if verbose:
             print("✅ Qwen Image 2.1 is already loaded.")
+            print("Devices:", DEVICE_MAP)
             print_vram("Current VRAM")
         return {
             "loaded": True,
             "already_loaded": True,
+            "devices": dict(DEVICE_MAP),
             "gpus": get_gpu_info(),
         }
 
@@ -274,9 +377,7 @@ async def load_model(
     COMFY_PATH = get_comfy_path(comfy_path)
 
     if not COMFY_PATH.is_dir():
-        raise FileNotFoundError(
-            f"ComfyUI directory not found: {COMFY_PATH}"
-        )
+        raise FileNotFoundError(f"ComfyUI directory not found: {COMFY_PATH}")
 
     os.chdir(COMFY_PATH)
 
@@ -284,19 +385,24 @@ async def load_model(
     if comfy_str not in sys.path:
         sys.path.insert(0, comfy_str)
 
+    # Make cuda:0 the current device so nothing lands elsewhere by accident.
+    torch.cuda.set_device(0)
+
+    devices = resolve_devices(unet_device, clip_device, vae_device)
+
     if verbose:
         print("=" * 60)
         print("GPU DETECTION")
         print("=" * 60)
-
-        gpu_count = torch.cuda.device_count()
-        print("GPU count:", gpu_count)
+        print("GPU count:", torch.cuda.device_count())
 
         for item in get_gpu_info():
-            print(
-                f"GPU {item['id']}: {item['name']} | "
-                f"{item['total_gb']:.2f} GB"
-            )
+            print(f"GPU {item['id']}: {item['name']} | {item['total_gb']:.2f} GB")
+
+        print("\nDevice plan:")
+        print(f"  UNET : {devices['unet']}")
+        print(f"  CLIP : {devices['clip']}")
+        print(f"  VAE  : {devices['vae']}")
 
     import nodes
 
@@ -306,11 +412,9 @@ async def load_model(
     )
 
     from nodes import (
-        CLIPLoader,
         KSampler,
         NODE_CLASS_MAPPINGS as NODE_MAP,
         VAEDecode,
-        VAELoader,
     )
 
     NODE_CLASS_MAPPINGS = NODE_MAP
@@ -321,12 +425,7 @@ async def load_model(
     except Exception:
         model_management = None
 
-    required = [
-        "UnetLoaderGGUF",
-        "TextEncodeQwenImage21",
-    ]
-
-    for name in required:
+    for name in ("UnetLoaderGGUF", "TextEncodeQwenImage21"):
         if name not in NODE_CLASS_MAPPINGS:
             raise RuntimeError(f"Missing required ComfyUI node: {name}")
 
@@ -334,129 +433,82 @@ async def load_model(
     sampler = KSampler()
     vae_decoder = VAEDecode()
 
-    clip_loader = CLIPLoader()
-    vae_loader = VAELoader()
-
-    gpu_count = torch.cuda.device_count()
-    multi_gpu = bool(prefer_multi_gpu and gpu_count >= 2)
-
     # --------------------------------------------------------
     # UNET
     # --------------------------------------------------------
 
     if verbose:
-        print("\nLoading GGUF model...")
+        print(f"\nLoading GGUF UNET on {devices['unet']}...")
 
-    multi_unet_name = None
+    UNET, used = _load_on_device(
+        candidates=("UnetLoaderGGUFMultiGPU",),
+        device=devices["unet"],
+        kwargs={"unet_name": unet_name},
+        label="UNET",
+        allow_plain_fallback="UnetLoaderGGUF",
+        plain_kwargs={"unet_name": unet_name},
+    )
 
-    if multi_gpu:
-        for candidate in (
-            "UnetLoaderGGUFMultiGPU",
-            "UnetLoaderGGUFDisTorch2MultiGPU",
-            "UnetLoaderGGUFDisTorchMultiGPU",
-        ):
-            if candidate in NODE_CLASS_MAPPINGS:
-                multi_unet_name = candidate
-                break
+    if verbose:
+        print(f"✅ UNET loaded via {used} -> {devices['unet']}")
 
-    if multi_unet_name:
-        loader = NODE_CLASS_MAPPINGS[multi_unet_name]()
-
-        input_info = loader.INPUT_TYPES()
-        required_inputs = input_info.get("required", {})
-        optional_inputs = input_info.get("optional", {})
-
-        kwargs = {"unet_name": unet_name}
-
-        if "device" in required_inputs or "device" in optional_inputs:
-            kwargs["device"] = "cuda:0"
-
-        UNET = get_output(loader.load_unet(**kwargs))
-
-        if verbose:
-            print(f"✅ UNET loaded with {multi_unet_name} on cuda:0")
-    else:
-        loader = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-        UNET = get_output(
-            loader.load_unet(
-                unet_name=unet_name
-            )
-        )
-
-        if verbose:
-            print("✅ UNET loaded")
+    clean_memory()
 
     # --------------------------------------------------------
     # CLIP
     # --------------------------------------------------------
 
     if verbose:
-        print("\nLoading text encoder...")
+        print(f"\nLoading text encoder on {devices['clip']}...")
 
-    multi_clip_name = None
-
-    if multi_gpu:
-        for candidate in (
-            "CLIPLoaderGGUFMultiGPU",
-            "CLIPLoaderGGUFDisTorch2MultiGPU",
-            "CLIPLoaderGGUFDisTorchMultiGPU",
-        ):
-            if candidate in NODE_CLASS_MAPPINGS:
-                multi_clip_name = candidate
-                break
-
-    if multi_clip_name:
-        loader = NODE_CLASS_MAPPINGS[multi_clip_name]()
-
-        input_info = loader.INPUT_TYPES()
-        required_inputs = input_info.get("required", {})
-        optional_inputs = input_info.get("optional", {})
-
-        kwargs = {
+    if str(clip_name).lower().endswith(".gguf"):
+        clip_candidates = ("CLIPLoaderGGUFMultiGPU",)
+        clip_plain = "CLIPLoaderGGUF"
+        clip_plain_kwargs = {"clip_name": clip_name, "type": "qwen_image"}
+    else:
+        clip_candidates = ("CLIPLoaderMultiGPU",)
+        clip_plain = "CLIPLoader"
+        # Core CLIPLoader needs device="default" -> only valid on 1 GPU (= cuda:0).
+        clip_plain_kwargs = {
             "clip_name": clip_name,
             "type": "qwen_image",
+            "device": "default",
         }
 
-        if "device" in required_inputs or "device" in optional_inputs:
-            kwargs["device"] = "cuda:1"
+    CLIP, used = _load_on_device(
+        candidates=clip_candidates,
+        device=devices["clip"],
+        kwargs={"clip_name": clip_name, "type": "qwen_image"},
+        label="CLIP",
+        allow_plain_fallback=clip_plain,
+        plain_kwargs=clip_plain_kwargs,
+    )
 
-        CLIP = get_output(loader.load_clip(**kwargs))
+    if verbose:
+        print(f"✅ CLIP loaded via {used} -> {devices['clip']}")
 
-        if verbose:
-            print(f"✅ CLIP loaded with {multi_clip_name} on cuda:1")
-    else:
-        # On a single GPU, use default.
-        # On multiple GPUs without a compatible explicit loader, use CPU
-        # so cuda:0 remains available to the diffusion model.
-        clip_device = "cpu" if multi_gpu else "default"
-
-        CLIP = get_output(
-            clip_loader.load_clip(
-                clip_name=clip_name,
-                type="qwen_image",
-                device=clip_device,
-            )
-        )
-
-        if verbose:
-            print(f"✅ CLIP loaded ({clip_device})")
+    clean_memory()
 
     # --------------------------------------------------------
     # VAE
     # --------------------------------------------------------
 
     if verbose:
-        print("\nLoading VAE...")
+        print(f"\nLoading VAE on {devices['vae']}...")
 
-    VAE = get_output(
-        vae_loader.load_vae(
-            vae_name=vae_name
-        )
+    VAE, used = _load_on_device(
+        candidates=("VAELoaderMultiGPU",),
+        device=devices["vae"],
+        kwargs={"vae_name": vae_name},
+        label="VAE",
+        allow_plain_fallback="VAELoader",
+        plain_kwargs={"vae_name": vae_name},
     )
 
     if verbose:
-        print("✅ VAE loaded")
+        print(f"✅ VAE loaded via {used} -> {devices['vae']}")
 
+    DEVICE_MAP = dict(devices)
     _LOADED = True
 
     clean_memory()
@@ -465,12 +517,16 @@ async def load_model(
         print("\n" + "=" * 60)
         print("🔥 QWEN IMAGE 2.1 READY")
         print("=" * 60)
+        print("Reported load devices:")
+        print(f"  UNET : {_describe_device(UNET)}")
+        print(f"  CLIP : {_describe_device(CLIP)}")
+        print(f"  VAE  : {_describe_device(VAE)}")
         print_vram("After model load")
 
     return {
         "loaded": True,
         "already_loaded": False,
-        "multi_gpu": multi_gpu,
+        "devices": dict(DEVICE_MAP),
         "gpus": get_gpu_info(),
     }
 
@@ -501,23 +557,8 @@ def generate_image(
     """
     Generate and save one image.
 
-    Example:
-        result = qwen.generate_image(
-            prompt="cinematic anime hero",
-            width=1280,
-            height=720,
-            steps=28,
-            cfg=2.2,
-        )
-
     Returns:
-        {
-            "image": PIL.Image.Image,
-            "path": ".../saved_images/...",
-            "seed": int,
-            "width": int,
-            "height": int,
-        }
+        {"image": PIL.Image, "path": str, "seed": int, "width": int, "height": int}
     """
     if not _LOADED:
         raise RuntimeError(
@@ -536,23 +577,16 @@ def generate_image(
     if align_dimensions:
         width = _align_dimension(width, 16)
         height = _align_dimension(height, 16)
-    else:
-        if width % 16 != 0 or height % 16 != 0:
-            raise ValueError(
-                "width and height must be divisible by 16 "
-                "when align_dimensions=False"
-            )
+    elif width % 16 != 0 or height % 16 != 0:
+        raise ValueError(
+            "width and height must be divisible by 16 when align_dimensions=False"
+        )
 
-    if seed is None:
-        seed = random.randint(0, 9999999)
-    else:
-        seed = int(seed)
+    seed = random.randint(0, 9999999) if seed is None else int(seed)
 
     output_dir = Path(output_dir)
-
     if not output_dir.is_absolute():
         output_dir = get_root_path() / output_dir
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if verbose:
@@ -565,21 +599,9 @@ def generate_image(
         print("Sampler  :", sampler_name)
         print("Scheduler:", scheduler)
         print("Seed     :", seed)
+        print("Devices  :", DEVICE_MAP)
 
     clean_memory()
-
-    encoded = None
-    positive = None
-    negative = None
-    encoder_latent = None
-    latent = None
-    sampled = None
-    latent_result = None
-    decoded = None
-    images = None
-    image_tensor = None
-    image_np = None
-    pil_image = None
 
     try:
         with torch.inference_mode():
@@ -598,25 +620,14 @@ def generate_image(
             positive = get_output(encoded, 0)
             negative = get_output(encoded, 1)
 
-            # Qwen's text encoder also emits a default latent.
-            # We discard it and create one using the exact requested size.
-            encoder_latent = get_output(encoded, 2)
-
+            # Encoder emits a default latent; discard it and build the exact size.
             latent = {
                 "samples": torch.zeros(
-                    (
-                        1,
-                        64,
-                        height // 16,
-                        width // 16,
-                    ),
+                    (1, 64, height // 16, width // 16),
                     dtype=torch.float32,
                     device="cpu",
                 )
             }
-
-            del encoder_latent
-            encoder_latent = None
 
             if verbose:
                 print(f"Sampling {width}x{height}...")
@@ -637,32 +648,21 @@ def generate_image(
             latent_result = get_output(sampled, 0)
 
             del encoded, positive, negative, latent, sampled
-            encoded = positive = negative = latent = sampled = None
-
             clean_memory()
 
             if verbose:
                 print("Decoding...")
 
-            decoded = vae_decoder.decode(
-                samples=latent_result,
-                vae=VAE,
-            )
-
+            decoded = vae_decoder.decode(samples=latent_result, vae=VAE)
             images = get_output(decoded, 0)
 
             del decoded, latent_result
-            decoded = latent_result = None
 
-        image_tensor = images[0]
-        image_np = image_tensor.detach().cpu().numpy()
+        image_np = images[0].detach().cpu().numpy()
         image_np = np.clip(image_np * 255.0, 0, 255).astype(np.uint8)
-
         pil_image = Image.fromarray(image_np)
 
-        filename = _make_filename(str(prompt), seed)
-        output_path = output_dir / filename
-
+        output_path = output_dir / _make_filename(str(prompt), seed)
         pil_image.save(output_path, format="PNG")
 
         if verbose:
@@ -680,27 +680,7 @@ def generate_image(
         }
 
     finally:
-        # Remove only generation-time objects.
-        # UNET / CLIP / VAE remain loaded for the next call.
-        for name in (
-            "encoded",
-            "positive",
-            "negative",
-            "encoder_latent",
-            "latent",
-            "sampled",
-            "latent_result",
-            "decoded",
-            "images",
-            "image_tensor",
-            "image_np",
-        ):
-            if name in locals():
-                try:
-                    del locals()[name]
-                except Exception:
-                    pass
-
+        # UNET / CLIP / VAE stay loaded for the next call.
         if cleanup_after:
             clean_memory()
 
@@ -710,9 +690,10 @@ def generate_image(
 # ============================================================
 
 def unload_model(verbose: bool = True) -> None:
-    """Unload Qwen models and free GPU memory."""
+    """Unload Qwen models and free GPU memory on all GPUs."""
     global UNET, CLIP, VAE
     global text_encoder, sampler, vae_decoder
+    global DEVICE_MAP
     global _LOADED
 
     UNET = None
@@ -722,6 +703,7 @@ def unload_model(verbose: bool = True) -> None:
     text_encoder = None
     sampler = None
     vae_decoder = None
+    DEVICE_MAP = {}
 
     if model_management is not None:
         try:
