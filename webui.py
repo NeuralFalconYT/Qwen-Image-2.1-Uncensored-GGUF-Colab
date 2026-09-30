@@ -476,7 +476,8 @@ if __name__ == "__main__":
         theme=custom_theme,
         css=CSS,
         footer_links=["api", "gradio"],
-        mcp_server=True,
+        mcp_server=False,
+        allowed_paths=['./saved_images'],
         debug=True,
         share=True
     )
